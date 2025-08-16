@@ -1,0 +1,10 @@
+
+fastapi
+uvicorn[standard]
+pydantic
+numpy
+torch  # install CUDA build separately via PyTorch index if needed
+transformers>=4.41.0
+huggingface_hub>=0.23.0
+accelerate>=0.33.0
+safetensors>=0.4.3
