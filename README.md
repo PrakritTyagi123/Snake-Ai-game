@@ -6,7 +6,6 @@ A polished reinforcement-learning playground for training a Snake agent (Double 
 
 ## 📸 Preview
 
-*(Add screenshots in `docs/images/` and replace the placeholders below.)*
 
 ![Training Dashboard – Game + Controls](docs/images/01_dashboard.png)
 
