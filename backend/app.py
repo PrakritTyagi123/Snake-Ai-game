@@ -1,13 +1,15 @@
 from __future__ import annotations
 import asyncio
-from typing import Any, Dict
+import os
+import signal
+from typing import Any, Dict, List
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Body
 from fastapi.middleware.cors import CORSMiddleware
 
-from .train.loop import Trainer, BroadcastManager
+from backend.train.loop import Trainer
 
-app = FastAPI(title="Snake AI Backend", version="1.0")
+app = FastAPI(title="Snake AI Backend", version="1.2")
 
 # CORS for the static frontend on 8080
 app.add_middleware(
@@ -18,64 +20,128 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# create trainer/broadcaster, bind loop on startup
-broadcaster = BroadcastManager(loop=None)
-trainer = Trainer(broadcaster=broadcaster)
+class BroadcastManager:
+    def __init__(self) -> None:
+        self.conns: List[WebSocket] = []
 
-@app.on_event("startup")
-async def _bind_loop():
-    broadcaster.loop = asyncio.get_running_loop()
+    async def send_json(self, payload: Dict[str, Any]) -> None:
+        dead: List[WebSocket] = []
+        for ws in list(self.conns):
+            try:
+                await ws.send_json(payload)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            try:
+                self.conns.remove(ws)
+            except ValueError:
+                pass
+
+    async def close_all(self) -> None:
+        # best-effort close of all websockets
+        conns = list(self.conns)
+        self.conns.clear()
+        for ws in conns:
+            try:
+                await ws.close(code=1001, reason="Server shutting down")
+            except Exception:
+                pass
+
+broadcaster = BroadcastManager()
+trainer = Trainer(broadcaster.send_json)
+try:
+    trainer.load_checkpoint
+except Exception:
+    pass
 
 # -------- REST --------
 @app.get("/api/config")
-def api_get_config():
-    # support w/h attributes named either w/h or width/height
-    w = getattr(trainer.env, "w", None) or getattr(trainer.env, "width", None)
-    h = getattr(trainer.env, "h", None) or getattr(trainer.env, "height", None)
-    return {
-        "ok": True,
-        "step_delay_ms": trainer.params.get("step_delay_ms", 0),
-        "board": {"w": w, "h": h},
-        "params": trainer.params,
-        "total_steps": trainer.total_steps,
-    }
+def api_get_config() -> Dict[str, Any]:
+    return trainer.get_config()
 
 @app.post("/api/config")
-def api_post_config(payload: dict = Body(...)):
-    return trainer.update_config(payload)
-
-@app.post("/api/update_config")
-def api_update_config(payload: dict = Body(...)):
-    return trainer.update_config(payload)
-
-@app.post("/api/start")
-def api_start(payload: dict = Body(default={})):
-    trainer.start(payload)
+def api_set_config(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    trainer.update_config(payload)
     return {"ok": True}
 
+@app.post("/api/update_config")
+def api_update_config(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    trainer.update_config(payload)
+    return {"ok": True, "params": trainer.get_config()}
+
+@app.post("/api/start")
+def api_start(payload: Dict[str, Any] = Body(default={})) -> Dict[str, Any]:
+    # 1) Load whatever exists for the currently selected algo (if any)
+    loaded = trainer.load_checkpoint()
+    # 2) Re-apply UI config AFTER loading, so UI overrides the checkpoint values
+    trainer.update_config(payload or {})
+    # 3) Start training
+    trainer.start()
+    return {"ok": True, "loaded": loaded}
+
 @app.post("/api/pause")
-def api_pause():
-    trainer.pause(); return {"ok": True}
+async def api_pause() -> Dict[str, Any]:
+    await trainer.pause_and_save()
+    return {"ok": True}
 
 @app.post("/api/resume")
-def api_resume():
-    trainer.resume(); return {"ok": True}
+def api_resume() -> Dict[str, Any]:
+    trainer.resume()
+    return {"ok": True}
 
 @app.post("/api/stop")
-def api_stop():
-    trainer.stop(); return {"ok": True}
+def api_stop() -> Dict[str, Any]:
+    trainer.stop()
+    return {"ok": True}
 
 @app.post("/api/reset")
-def api_reset():
-    trainer.reset_env(); return {"ok": True}
+def api_reset() -> Dict[str, Any]:
+    trainer.reset()
+    return {"ok": True}
 
 @app.post("/api/save")
-def api_save():
-    return trainer.save()
+async def api_save() -> Dict[str, Any]:
+    await trainer.save_checkpoint(reason="api_save")
+    return {"ok": True}
 
 @app.post("/api/load")
-def api_load(payload: dict = Body(default={})):
-    return trainer.load(payload.get("path"))
+def api_load() -> Dict[str, Any]:
+    ok = trainer.load_checkpoint()
+    return {"ok": ok}
+
+@app.post("/api/close")
+async def api_close() -> Dict[str, Any]:
+    # 1) pause + save (allow WS events to show "Saving…")
+    await trainer.pause_and_save()
+    try:
+        trainer.flush_episode_log()
+    except Exception:
+        pass
+    # 2) tell clients we're closing
+    await broadcaster.send_json({"type": "server_closing"})
+    # 3) stop sending late events, then close sockets
+    trainer.closing = True
+    await broadcaster.close_all()
+    # 4) shutdown trainer threads/loops
+    trainer.shutdown()
+    # 5) schedule process exit after response is sent
+    loop = asyncio.get_running_loop()
+    loop.call_later(0.2, lambda: os.kill(os.getpid(), signal.SIGINT))
+    return {"ok": True}
+
+# -------- lifecycle hooks --------
+@app.on_event("shutdown")
+async def on_shutdown():
+    try:
+        trainer.closing = True
+        await broadcaster.close_all()
+        try:
+            trainer.flush_episode_log()
+        except Exception:
+            pass
+        trainer.shutdown()
+    except Exception:
+        pass
 
 # -------- WebSocket --------
 @app.websocket("/ws/stream")

@@ -1,4 +1,4 @@
-/* Snake AI UI — view 3-way toggle; algorithm selector; grid size selector; live sliders; LLM feed */
+/* Snake AI UI — with saving indicator + Close Project (FULL, FIXED) */
 (() => {
   const CONFIG = window.__CONFIG__ || {
     API_URL: "http://127.0.0.1:5000",
@@ -17,10 +17,7 @@
     nnPanel: document.getElementById("nnVisualization"),
     graphsPanel: document.getElementById("graphsPanel"),
 
-    // Algorithm segment control
-    algoSeg: document.getElementById("algoSeg"),
-
-    // Grid size
+    algoSelect: document.getElementById("algoSelect"),
     gridSize: document.getElementById("gridSizeSelect"),
 
     start: document.getElementById("startBtn"),
@@ -30,6 +27,7 @@
     reset: document.getElementById("resetBtn"),
     save: document.getElementById("saveBtn"),
     load: document.getElementById("loadBtn"),
+    close: document.getElementById("closeBtn"),
     status: document.getElementById("runStatus"),
 
     epsSlider: document.getElementById("epsilonSlider"),
@@ -51,10 +49,18 @@
 
     llmPanel: document.getElementById("llmPanel"),
     llmFeed: document.getElementById("llmFeed"),
+
+    saveIndicator: document.getElementById("saveIndicator"),
   };
 
   const fmt = (v)=> (v===undefined||v===null ? "" : Number(v).toFixed(4));
   const debounce = (fn, ms=150)=>{ let t; return (...args)=>{ clearTimeout(t); t=setTimeout(()=>fn(...args), ms); }; };
+
+  // --- small helper used by sliders ---
+  async function postConfigUpdate(patch){
+    try { return await restPost("/api/config", patch); }
+    catch (e) { console.warn(e); return { ok:false, error:String(e) }; }
+  }
 
   // Canvas/grid
   const ctx = el.canvas.getContext("2d");
@@ -69,66 +75,154 @@
     g.fillStyle = "#000"; g.fillRect(0,0,W,H);
     g.strokeStyle = "rgba(255,255,255,0.18)"; g.lineWidth = 1;
     for (let x=0;x<=board.w;x++){ g.beginPath(); g.moveTo(x*cw,0); g.lineTo(x*cw,H); g.stroke(); }
-    for (let y=0;y<=board.h;y++){ g.beginPath(); g.moveTo(0,y*ch); g.lineTo(W,y*ch); g.stroke(); }
+    for (let y=0;y<=board.h;y++){ g.beginPath(); g.moveTo(0,y*ch); g.lineTo(0+W,y*ch); g.stroke(); }
   }
   const drawGrid = ()=> ctx.drawImage(gridCache, 0, 0);
+
   function renderStateFrame(frame){
     if (!frame || !frame.grid) return;
     const W=el.canvas.width, H=el.canvas.height;
     const cw = W / frame.grid.w, ch = H / frame.grid.h;
     drawGrid();
-    if (frame.grid.food) {
+
+    // be robust to {x,y} or [x,y]
+    let food = frame.grid.food;
+    if (Array.isArray(food)) food = { x: food[0], y: food[1] };
+    if (food && Number.isFinite(food.x) && Number.isFinite(food.y)) {
       ctx.fillStyle = "#f2c94c";
-      ctx.fillRect(frame.grid.food[0]*cw+1, frame.grid.food[1]*ch+1, cw-2, ch-2);
+      ctx.fillRect(food.x*cw+1, food.y*ch+1, cw-2, ch-2);
     }
+
+    // snake: array of {x,y} or array of [x,y]
     if (Array.isArray(frame.grid.snake)) {
       frame.grid.snake.forEach((seg, idx) => {
-        const [x,y]=seg;
+        const x = Array.isArray(seg) ? seg[0] : seg.x;
+        const y = Array.isArray(seg) ? seg[1] : seg.y;
+        if (!Number.isFinite(x) || !Number.isFinite(y)) return;
         ctx.fillStyle = idx===0 ? "#00ffc6" : "#1e90ff";
         ctx.fillRect(x*cw+1, y*ch+1, cw-2, ch-2);
       });
     }
   }
 
-  const showWinOverlay = ()=>{
-    el.overlayWin.classList.add("show");
-    el.overlayWin.setAttribute("aria-hidden","false");
-    el.overlayLoss.classList.remove("show");
-    el.overlayLoss.setAttribute("aria-hidden","true");
-  };
-  const hideOverlays = ()=>{
-    el.overlayWin.classList.remove("show");
-    el.overlayLoss.classList.remove("show");
-    el.overlayWin.setAttribute("aria-hidden","true");
-    el.overlayLoss.setAttribute("aria-hidden","true");
-  };
+  const showWinOverlay = ()=>{ el.overlayWin.classList.add("show"); el.overlayWin.setAttribute("aria-hidden","false"); el.overlayLoss.classList.remove("show"); el.overlayLoss.setAttribute("aria-hidden","true"); };
+  const hideOverlays  = ()=>{ el.overlayWin.classList.remove("show"); el.overlayLoss.classList.remove("show"); el.overlayWin.setAttribute("aria-hidden","true"); el.overlayLoss.setAttribute("aria-hidden","true"); };
 
-  // Charts
+  /* ===== Charts ===== */
   let charts = { score:null, epsilon:null, loss:null };
-  function initCharts(){
+  let chartsInitialized = false;
+
+  function initCharts() {
     if (!window.Chart) return;
-    charts.score = new Chart(el.scoreChartEl.getContext("2d"), { type:"line", data:{labels:[], datasets:[{label:"Score", data:[]}]}, options:{responsive:true, animation:false}});
-    charts.epsilon = new Chart(el.epsilonChartEl.getContext("2d"), { type:"line", data:{labels:[], datasets:[{label:"Epsilon", data:[]}]}, options:{responsive:true, animation:false}});
-    charts.loss = new Chart(el.lossChartEl.getContext("2d"), { type:"line", data:{labels:[], datasets:[{label:"Avg Loss", data:[]}]}, options:{responsive:true, animation:false}});
+
+    const common = {
+      type: "line",
+      options: {
+        responsive: true,
+        animation: false,
+        maintainAspectRatio: true,
+        aspectRatio: 8,
+        interaction: { mode: "nearest", intersect: false },
+        plugins: {
+          legend: { labels: { color: "#e6f1ff" } },
+          tooltip: {
+            enabled: true,
+            callbacks: {
+              title: (items) => (items[0] ? `Episode ${items[0].label}` : ""),
+              label: (ctx) => `${ctx.dataset.label}: ${Number(ctx.parsed.y).toFixed(3)}`
+            }
+          }
+        },
+        scales: {
+          x: { ticks: { color: "#a1acc4" }, grid: { color: "rgba(255,255,255,0.08)" } },
+          y: { ticks: { color: "#a1acc4" }, grid: { color: "rgba(255,255,255,0.08)" } }
+        }
+      }
+    };
+
+    charts.score = new Chart(el.scoreChartEl.getContext("2d"), {
+      ...common,
+      data: { labels: [], datasets: [{
+        label: "Score", data: [],
+        borderColor: "#17c964", backgroundColor: "rgba(23,201,100,.18)",
+        borderWidth: 2, pointRadius: 0, tension: 0.2, fill: true
+      }]}
+    });
+
+    charts.epsilon = new Chart(el.epsilonChartEl.getContext("2d"), {
+      ...common,
+      data: { labels: [], datasets: [{
+        label: "Epsilon", data: [],
+        borderColor: "#7aa2f7", backgroundColor: "rgba(122,162,247,.20)",
+        borderWidth: 2, pointRadius: 0, tension: 0.2, fill: true
+      }]}
+    });
+
+    charts.loss = new Chart(el.lossChartEl.getContext("2d"), {
+      ...common,
+      data: { labels: [], datasets: [{
+        label: "Avg Loss", data: [],
+        borderColor: "#ffd166", backgroundColor: "rgba(255,209,102,.25)",
+        borderWidth: 2, pointRadius: 0, tension: 0.2, fill: true
+      }]}
+    });
+
+    chartsInitialized = true;
   }
+
   function chartAppend(chart,x,y){
     if(!chart) return;
     chart.data.labels.push(x);
     chart.data.datasets[0].data.push(y);
-    if(chart.data.labels.length>200){ chart.data.labels.shift(); chart.data.datasets[0].data.shift(); }
-    chart.update();
+    if(chart.data.labels.length>1000){ chart.data.labels.shift(); chart.data.datasets[0].data.shift(); }
+    chart.update("none");
   }
+  function ensureCharts() {
+    if (!chartsInitialized) {
+      initCharts();
+    } else {
+      charts.score && charts.score.resize();
+      charts.epsilon && charts.epsilon.resize();
+      charts.loss && charts.loss.resize();
+    }
+  }
+  function fmtDuration(ms) {
+  const n = Number(ms);
+  if (!Number.isFinite(n) || n <= 0) return "";
+  const totalSec = n / 1000;
+  if (totalSec < 60) return `${totalSec.toFixed(1)}s`;
+  const m = Math.floor(totalSec / 60);
+  const s = Math.floor(totalSec - m * 60);
+  return `${m}m ${s}s`;
+}
 
-  // Table
-  function addEpisodeRow(row){
+  // ---- EPISODE TABLE (keep latest 1000) ----
+  let episodes = [];
+  function renderEpisodeTable(rows){
+  if (!el.tableBody) return;
+  const frag = document.createDocumentFragment();
+  // newest first
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const r = rows[i];
     const tr = document.createElement("tr");
-    tr.innerHTML = `<td>${row.episode??""}</td><td>${row.outcome??""}</td><td>${row.reason??""}</td>
-      <td>${row.score??""}</td><td>${row.snake_length??""}</td><td>${fmt(row.epsilon)}</td>
-      <td>${fmt(row.avg_loss)}</td><td>${row.steps??""}</td><td>${row.duration_ms??""}</td><td>${row.timestamp??""}</td>`;
-    el.tableBody.prepend(tr);
+    tr.innerHTML = `
+      <td>${r.episode ?? ""}</td>
+      <td>${r.outcome ?? ""}</td>
+      <td>${r.reason ?? ""}</td>
+      <td>${r.score ?? ""}</td>
+      <td>${r.snake_length ?? ""}</td>
+      <td>${fmt(r.epsilon)}</td>
+      <td>${fmt(r.avg_loss)}</td>
+      <td>${r.steps ?? ""}</td>
+      <td>${fmtDuration(r.duration_ms)}</td>
+      <td>${r.timestamp ? new Date(r.timestamp).toLocaleTimeString() : ""}</td>`;
+    frag.appendChild(tr);
   }
+  el.tableBody.innerHTML = "";
+  el.tableBody.appendChild(frag);
+}
 
-  // Neural diagram (16→12→8→4)
+  // ---- NN (static sizes, with blink) ----
   const INPUT_LABELS = [
     "dir_up","dir_down","dir_left","dir_right",
     "danger_fwd","danger_left","danger_right",
@@ -137,28 +231,27 @@
     "length_ratio","score_norm","bias"
   ];
   const NN_LAYERS = [16,12,8,4];
-  const NN = { nodes:[], links:[], nodeSel:null, linkSel:null, outputQText:null,
-    prevActs:[new Float32Array(16), new Float32Array(12), new Float32Array(8), new Float32Array(4)], targetLinksByLayer:[] };
+  const NN = { prevActs:[new Float32Array(16), new Float32Array(12), new Float32Array(8), new Float32Array(4)] };
 
   function drawNeuralDiagram(){
     const svg = d3.select(el.nnSvg); svg.selectAll("*").remove();
     const width = el.nnSvg.clientWidth || 800, height = el.nnSvg.clientHeight || 360;
     const layerSpacing = width / (NN_LAYERS.length + 1);
 
-    const nodes = [], nodeMap = {};
+    const nodes=[], nodeMap={};
     NN_LAYERS.forEach((count, l)=>{
       const ySpacing = height / (count + 1);
       for (let i=0;i<count;i++){
-        const n = { id:`${l}-${i}`, layer:l, idx:i, x:(l+1)*layerSpacing, y:(i+1)*ySpacing };
-        nodes.push(n); nodeMap[n.id] = n;
+        const n={id:`${l}-${i}`, layer:l, idx:i, x:(l+1)*layerSpacing, y:(i+1)*ySpacing};
+        nodes.push(n); nodeMap[n.id]=n;
       }
     });
 
-    const links = [];
+    const links=[];
     for (let l=0;l<NN_LAYERS.length-1;l++){
       for (let i=0;i<NN_LAYERS[l];i++){
         for (let j=0;j<NN_LAYERS[l+1];j++){
-          links.push({ source:`${l}-${i}`, target:`${l+1}-${j}`, tLayer:l+1, tIdx:j });
+          links.push({source:`${l}-${i}`, target:`${l+1}-${j}`, tLayer:l+1, tIdx:j});
         }
       }
     }
@@ -172,11 +265,13 @@
       .attr("class", d => d.layer===NN_LAYERS.length-1 ? "node output" : "node")
       .attr("cx",d=>d.x).attr("cy",d=>d.y).attr("r",8);
 
+    // input labels
     svg.selectAll("text.input-label").data(nodes.filter(n=>n.layer===0))
       .enter().append("text").attr("class","node-label input-label")
       .attr("x", d=>d.x - 14).attr("y", d=>d.y + 4).attr("text-anchor","end")
       .text((d,i)=> INPUT_LABELS[i] ?? `in_${i}`);
 
+    // output labels + Q values
     const outNames = ["Up","Down","Left","Right"];
     const lastL = NN_LAYERS.length-1;
     svg.selectAll("text.node-label.output-label").data(nodes.filter(n=>n.layer===lastL))
@@ -189,99 +284,116 @@
       .attr("x", d=>d.x + 14).attr("y", d=>d.y + 10)
       .text("-");
 
-    const targetLinksByLayer = Array.from({length: NN_LAYERS.length}, (_, l)=>
+    // store
+    NN.nodeSel = nodeSel;
+    NN.linkSel = linkSel;
+    NN.outputQText = outputQText;
+    NN.prevActs = NN_LAYERS.map(count => new Float32Array(count));
+    NN.targetLinksByLayer = Array.from({length: NN_LAYERS.length}, (_, l)=>
       l===0 ? null : Array.from({length: NN_LAYERS[l]}, ()=>[])
     );
-    links.forEach((L, idx)=> targetLinksByLayer[L.tLayer][L.tIdx].push(idx));
-
-    NN.nodes = nodes; NN.links = links;
-    NN.nodeSel = nodeSel; NN.linkSel = linkSel; NN.outputQText = outputQText;
-    NN.targetLinksByLayer = targetLinksByLayer;
+    links.forEach((L, idx)=> NN.targetLinksByLayer[L.tLayer][L.tIdx].push(idx));
   }
 
-  function fitArray(arr, outLen){
-    if (!Array.isArray(arr) || arr.length === 0) return new Float32Array(outLen);
-    const out = new Float32Array(outLen);
-    const n = arr.length;
-    for (let i=0;i<outLen;i++){
-      const src = Math.min(n-1, Math.round(i * (n-1) / Math.max(1,outLen-1)));
-      out[i] = Math.max(0, Math.min(1, Number(arr[src]) || 0));
+  function fitToCount(arr, n){
+    const out = new Float32Array(n);
+    if (!Array.isArray(arr) || arr.length === 0) return out;
+    const m = arr.length;
+    if (m === n) { for (let i=0;i<n;i++) out[i] = Number(arr[i]) || 0; return out; }
+    for (let i=0;i<n;i++){
+      const idx = Math.min(m-1, Math.round(i * (m-1) / Math.max(1,n-1)));
+      out[i] = Number(arr[idx]) || 0;
     }
     return out;
   }
 
   function applyNN(ev){
-    const L = ev && Array.isArray(ev.layers) ? ev.layers : [];
-    const h1 = fitArray((L[0] && (L[0].act || L[0].a)) || [], NN_LAYERS[1]);
-    const h2 = fitArray((L[1] && (L[1].act || L[1].a)) || h1, NN_LAYERS[2]);
-    const out = fitArray((L[L.length-1] && (L[L.length-1].q || L[L.length-1].act || L[L.length-1].a)) || [], NN_LAYERS[3]);
+    if (!ev || !NN.nodeSel || !NN.linkSel) return;
 
-    const th = 0.002;
-    const prev = NN.prevActs;
+    const layersMsg = Array.isArray(ev.layers) ? ev.layers : [];
+    const hiddenMsg = layersMsg.filter(l => Array.isArray(l.act)).map(l => l.act);
+    const qEntry = layersMsg.find(l => Array.isArray(l.q));
+    const outRaw = qEntry ? qEntry.q : [];
 
+    const hiddenCounts = NN_LAYERS.slice(1, NN_LAYERS.length-1);
+    const actsByLayer = [null];
+
+    for (let li=0; li<hiddenCounts.length; li++){
+      actsByLayer.push(fitToCount(hiddenMsg[li] || [], hiddenCounts[li]));
+    }
+    const outCount = NN_LAYERS[NN_LAYERS.length-1];
+    const outActs = fitToCount(outRaw, outCount);
+    actsByLayer.push(outActs);
+
+    const th = 0.006;
+    const lastIdx = NN_LAYERS.length-1;
+
+    // node blink
     NN.nodeSel.each(function(d){
       if (d.layer === 0) return;
-      const a = (d.layer===1? h1[d.idx] : d.layer===2? h2[d.idx] : out[d.idx]);
-      const p = prev[d.layer][d.idx];
+      const a = actsByLayer[d.layer] ? actsByLayer[d.layer][d.idx] : 0;
+      const p = (NN.prevActs[d.layer] && NN.prevActs[d.layer][d.idx]) || 0;
       const delta = a - p;
-      if (delta > th) { const s=d3.select(this); s.classed("blink-green", true); setTimeout(()=>s.classed("blink-green", false), 160); }
-      else if (delta < -th) { const s=d3.select(this); s.classed("blink-red", true); setTimeout(()=>s.classed("blink-red", false), 160); }
+      if (delta > th) { const s=d3.select(this); s.classed("blink-green",true); setTimeout(()=>s.classed("blink-green",false), 160); }
+      else if (delta < -th) { const s=d3.select(this); s.classed("blink-red",true); setTimeout(()=>s.classed("blink-red",false), 160); }
     });
 
+    // link highlight
     const linkElems = NN.linkSel.nodes();
-    function bumpLinks(layerIdx, activations){
-      const table = NN.targetLinksByLayer[layerIdx];
-      for (let j=0;j<activations.length;j++){
-        const a = activations[j], p = prev[layerIdx][j], delta = a - p;
+    for (let layerIdx=1; layerIdx<=lastIdx; layerIdx++){
+      const layerActs = actsByLayer[layerIdx];
+      if (!layerActs) continue;
+      const prevLayer = NN.prevActs[layerIdx];
+      const table = NN.targetLinksByLayer[layerIdx] || [];
+      for (let j=0;j<layerActs.length;j++){
+        const a = layerActs[j], p = prevLayer ? prevLayer[j] : 0;
+        const delta = a - p;
         if (Math.abs(delta) <= th) continue;
-        const indices = table[j];
+        const indices = table[j] || [];
         for (let k=0;k<indices.length;k++){
-          const el = d3.select(linkElems[indices[k]]);
-          el.classed("pos", delta > th).classed("neg", delta < -th);
+          const elLine = d3.select(linkElems[indices[k]]);
+          elLine.classed("pos", delta > th).classed("neg", delta < -th);
           const base = 0.35, extra = Math.min(0.65, Math.abs(delta) * 3);
-          el.style("opacity", base + extra);
+          elLine.style("opacity", base + extra);
         }
       }
     }
-    bumpLinks(1, h1); bumpLinks(2, h2); bumpLinks(3, out);
 
+    // Q text
     if (NN.outputQText) {
       const nodes = NN.outputQText.nodes();
-      for (let i=0;i<out.length && i<nodes.length;i++){
-        nodes[i].textContent = Number.isFinite(out[i]) ? out[i].toFixed(3) : "-";
+      for (let i=0;i<Math.min(nodes.length, outActs.length); i++){
+        nodes[i].textContent = Number.isFinite(outActs[i]) ? outActs[i].toFixed(3) : "-";
       }
     }
 
-    prev[1].set(h1); prev[2].set(h2); prev[3].set(out);
+    // commit prevActs
+    for (let layerIdx=1; layerIdx<NN.prevActs.length; layerIdx++){
+      const arr = actsByLayer[layerIdx];
+      if (arr) {
+        if (NN.prevActs[layerIdx].length !== arr.length) {
+          NN.prevActs[layerIdx] = new Float32Array(arr.length);
+        }
+        NN.prevActs[layerIdx].set(arr);
+      }
+    }
   }
 
-  // View toggle (3-way)
-  function selectView(view="neural"){
-    const isNone = view==="none", isNeural = view==="neural", isGraphs = view==="graphs";
-    el.viewNone.classList.toggle("active", isNone);
-    el.viewNeural.classList.toggle("active", isNeural);
-    el.viewGraphs.classList.toggle("active", isGraphs);
-
-    el.nnPanel.classList.toggle("hidden", !isNeural);
-    el.graphsPanel.classList.toggle("hidden", !isGraphs);
-    el.graphsPanel.setAttribute("aria-hidden", String(!isGraphs));
-  }
-
+  // REST helpers
   async function restPost(path, body){
-    try {
-      const res = await fetch(`${CONFIG.API_URL}${path}`, {
-        method:"POST",
-        headers:{ "Content-Type":"application/json" },
-        body: JSON.stringify(body||{})
-      });
-      return await res.json();
-    } catch (e) { return { ok:false, error:String(e) }; }
+    const url = `${CONFIG.API_URL}${path}`;
+    const res = await fetch(url, { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(body||{}) });
+    if (!res.ok) throw new Error(`POST ${path} -> ${res.status}`);
+    return await res.json();
   }
   async function restGet(path){
-    try { const res = await fetch(`${CONFIG.API_URL}${path}`); return await res.json(); }
-    catch { return null; }
+    const url = `${CONFIG.API_URL}${path}`;
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    return await res.json();
   }
 
+  // LLM feed
   function appendLLMComment(msg){
     if (!el.llmFeed) return;
     const wrapper = document.createElement("div");
@@ -290,12 +402,16 @@
     meta.className = "llm-meta";
     meta.textContent = `Episode ${msg.episode} • step ${msg.step}`;
     const body = document.createElement("div");
-    body.textContent = msg.text;
+    body.textContent = msg.text || "";
     wrapper.appendChild(meta);
     wrapper.appendChild(body);
     el.llmFeed.prepend(wrapper);
     while (el.llmFeed.children.length > 50) el.llmFeed.removeChild(el.llmFeed.lastChild);
   }
+
+  // Saving indicator
+  function showSaving(){ el.saveIndicator && el.saveIndicator.classList.remove("hidden"); }
+  function hideSaving(){ el.saveIndicator && el.saveIndicator.classList.add("hidden"); }
 
   // WebSocket
   let ws=null, lastStateFrame=null, lastNN=null, lastRenderTs=0;
@@ -311,43 +427,83 @@
           case "state_frame": lastStateFrame = data; break;
           case "nn_activations": lastNN = data; break;
           case "metrics_tick":
-            el.status.textContent = `Running (ep ${data.episode}, step ${data.step})`; break;
-          case "episode_summary":
-            addEpisodeRow(data);
-            chartAppend(charts.score, data.episode, data.score);
-            chartAppend(charts.epsilon, data.episode, data.epsilon);
-            chartAppend(charts.loss, data.episode, data.avg_loss);
-            if (data.outcome === "WIN") showWinOverlay();
+            if (el.status) el.status.textContent = `Running (ep ${data.episode}, step ${data.step})`;
             break;
+
+          case "episode_summary": {
+            // keep only the most recent 1000 rows in the UI
+            episodes.push(data);                       // <-- fixed (was episode.push)
+            if (episodes.length > 1000) episodes = episodes.slice(-1000);
+
+            // charts
+            ensureCharts();
+            chartAppend(charts.score,   data.episode, Number(data.score)||0);
+            chartAppend(charts.epsilon, data.episode, Number(data.epsilon)||0);
+            chartAppend(charts.loss,    data.episode, Number(data.avg_loss)||0);
+
+            // table render (newest first)
+            renderEpisodeTable(episodes);
+            break;
+          }
+
           case "game_over":
             if (data.outcome === "WIN") showWinOverlay();
             break;
+
           case "checkpoint_saved":
             console.log(`[ckpt] ${data.path} @ step ${data.total_steps}`);
             break;
+
           case "config_applied":
-            console.log("[WS] config_applied", data.params);
             if (data.params && data.params.board) {
-              // update board and rebuild grid immediately for visuals
               board.w = data.params.board.w;
               board.h = data.params.board.h;
               buildGridCache(); drawGrid();
             }
-            el.status.textContent = "Config applied";
+            if (typeof data.epsilon_current === "number" && el.epsVal) {
+              el.epsVal.textContent = Number(data.epsilon_current).toFixed(4);
+            }
+            if (el.status) el.status.textContent = "Config applied";
             break;
+
           case "board_changed":
-            // definitive confirmation after env rebuild
             if (data.board) {
               board.w = data.board.w; board.h = data.board.h;
               buildGridCache(); drawGrid();
             }
             break;
+
           case "llm_comment":
             appendLLMComment(data);
+            break;
+
+          case "saving_started":
+            showSaving();
+            break;
+          case "saving_finished":
+            hideSaving();
+            break;
+          case "saving_failed":
+            hideSaving();
+            alert("Save failed: " + (data.error || "unknown error"));
+            break;
+          case "server_closing":
+            showClosingOverlay();
             break;
         }
       };
     }catch(e){ console.warn("WS connect error", e); }
+  }
+
+  function showClosingOverlay(){
+    const overlay = document.createElement("div");
+    overlay.style.position="fixed"; overlay.style.inset="0"; overlay.style.zIndex="9999";
+    overlay.style.background="rgba(0,0,0,0.85)";
+    overlay.style.color="#ffd166";
+    overlay.style.display="flex"; overlay.style.alignItems="center"; overlay.style.justifyContent="center";
+    overlay.style.fontSize="22px"; overlay.style.fontWeight="800";
+    overlay.textContent = "Project closed — you can safely close this tab.";
+    document.body.appendChild(overlay);
   }
 
   function rafLoop(ts){
@@ -359,35 +515,42 @@
     requestAnimationFrame(rafLoop);
   }
 
-  // ----- Controls -----
+  // View toggle UI
   el.viewNone.addEventListener("click", ()=> selectView("none"));
   el.viewNeural.addEventListener("click", ()=> selectView("neural"));
-  el.viewGraphs.addEventListener("click", ()=> selectView("graphs"));
+  el.viewGraphs.addEventListener("click", ()=> { selectView("graphs"); ensureCharts(); });
 
-  // algorithm segment
+  function selectView(view = "neural") {
+    const isNone = view === "none", isNeural = view === "neural", isGraphs = view === "graphs";
+    el.viewNone.classList.toggle("active", isNone);
+    el.viewNeural.classList.toggle("active", isNeural);
+    el.viewGraphs.classList.toggle("active", isGraphs);
+    el.nnPanel.classList.toggle("hidden", !isNeural);
+    el.graphsPanel.classList.toggle("hidden", !isGraphs);
+    el.nnPanel.setAttribute("aria-hidden", String(!isNeural));
+    el.graphsPanel.setAttribute("aria-hidden", String(!isGraphs));
+  }
+
+  // algorithm dropdown
   let currentAlgo = "DDQN";
-  el.algoSeg.addEventListener("click", (e)=>{
-    const btn = e.target.closest(".seg-btn");
-    if (!btn) return;
-    el.algoSeg.querySelectorAll(".seg-btn").forEach(b=>b.classList.remove("active"));
-    btn.classList.add("active");
-    currentAlgo = btn.dataset.algo || "DDQN";
-    // notify backend (non-breaking if unused)
-    restPost("/api/update_config", { algorithm: currentAlgo });
-  });
+  if (el.algoSelect) {
+    el.algoSelect.addEventListener("change", ()=>{
+      currentAlgo = el.algoSelect.value || "DDQN";
+      restPost("/api/update_config", { algorithm: currentAlgo }).catch(()=>{});
+    });
+  }
 
   // grid size selector
   el.gridSize.addEventListener("change", async ()=>{
     const n = Number(el.gridSize.value) | 0;
-    // pre-apply visuals
     board.w = n; board.h = n; buildGridCache(); drawGrid();
-    // ask backend to resize (applies next episode)
-    await restPost("/api/update_config", { board: { w: n, h: n } });
+    await restPost("/api/update_config", { board: { w: n, h: n } }).catch(()=>{});
   });
 
+  // controls
   el.start.addEventListener("click", async ()=>{
     hideOverlays();
-    el.status.textContent = "Starting…";
+    if (el.status) el.status.textContent = "Starting…";
     const body = {
       algorithm: currentAlgo,
       max_episodes: 0, max_steps: 1000,
@@ -395,35 +558,62 @@
       batch_size: Number(el.batchSlider.value),
       epsilon: { start: 1.0, min: 0.05, decay: Number(el.epsSlider.value) }
     };
-    const res = await restPost("/api/start", body);
-    el.status.textContent = res?.ok ? "Running" : "Error starting";
+    try {
+      const res = await restPost("/api/start", body);
+      if (el.status) el.status.textContent = res?.ok ? "Running" : "Error starting";
+    } catch {
+      if (el.status) el.status.textContent = "Error starting";
+    }
   });
-  el.pause.addEventListener("click", async ()=>{ const r=await restPost("/api/pause"); el.status.textContent = r?.ok ? "Paused" : "Error"; });
-  el.resume.addEventListener("click", async ()=>{ const r=await restPost("/api/resume"); el.status.textContent = r?.ok ? "Running" : "Error"; });
-  el.stop.addEventListener("click", async ()=>{ const r=await restPost("/api/stop"); el.status.textContent = r?.ok ? "Stopped" : "Error"; });
-  el.reset.addEventListener("click", async ()=>{ hideOverlays(); drawGrid(); const r=await restPost("/api/reset"); el.status.textContent = r?.ok ? "Reset" : "Error"; });
-  el.save.addEventListener("click", async ()=>{ const r=await restPost("/api/save"); el.status.textContent = r?.ok ? "Saved" : "Error"; });
-  el.load.addEventListener("click", async ()=>{ const r=await restPost("/api/load"); el.status.textContent = r?.ok ? "Loaded" : "Error"; });
 
-  // reflect slider labels
-  const mirror = (slider, label, fmtFn=(v)=>v)=>{ const f=()=>{ label.textContent = fmtFn(slider.value); }; slider.addEventListener("input", f); f(); };
-  mirror(el.epsSlider,   el.epsVal,   v=>Number(v).toFixed(4));
-  mirror(el.lrSlider,    el.lrVal,    v=>Number(v).toFixed(4));
-  mirror(el.gammaSlider, el.gammaVal, v=>Number(v).toFixed(2));
-  mirror(el.batchSlider, el.batchVal, v=>String(v));
-  mirror(el.speedSlider, el.speedVal, v=>String(v));
+  el.pause.addEventListener("click", async ()=>{
+    try { const r = await restPost("/api/pause"); if (el.status) el.status.textContent = r?.ok ? "Paused" : "Error"; }
+    catch { if (el.status) el.status.textContent = "Error"; }
+  });
+  el.resume.addEventListener("click", async ()=>{
+    try { const r = await restPost("/api/resume"); if (el.status) el.status.textContent = r?.ok ? "Running" : "Error"; }
+    catch { if (el.status) el.status.textContent = "Error"; }
+  });
+  el.stop.addEventListener("click", async ()=>{
+    try { const r = await restPost("/api/stop"); if (el.status) el.status.textContent = r?.ok ? "Stopped" : "Error"; }
+    catch { if (el.status) el.status.textContent = "Error"; }
+  });
+  el.reset.addEventListener("click", async ()=>{
+    hideOverlays();
+    try { const r = await restPost("/api/reset"); if (el.status) el.status.textContent = r?.ok ? "Reset" : "Error"; }
+    catch { if (el.status) el.status.textContent = "Error"; }
+  });
+  el.save.addEventListener("click", async ()=>{
+    showSaving();
+    try { const r = await restPost("/api/save"); if (!r?.ok) hideSaving(); }
+    catch { hideSaving(); }
+  });
+  el.load.addEventListener("click", async ()=>{
+    try { const r = await restPost("/api/load"); if (el.status) el.status.textContent = r?.ok ? "Loaded" : "Error"; }
+    catch { if (el.status) el.status.textContent = "Error"; }
+  });
+  el.close.addEventListener("click", async ()=>{
+    showSaving();
+    try {
+      const r = await restPost("/api/close");
+      if (r?.ok) { window.close(); showClosingOverlay(); }
+      else { hideSaving(); alert("Close failed"); }
+    } catch { hideSaving(); alert("Close failed"); }
+  });
 
-  // Speed slider -> backend (/api/config)
-  const postSpeedConfig = debounce(async ()=>{
+  // Speed slider -> live label + /api/config
+  const postSpeedConfig = debounce(async () => {
     const step_delay_ms = Number(el.speedSlider.value) | 0;
-    await restPost("/api/config", { step_delay_ms });
+    try { await restPost("/api/config", { step_delay_ms }); } catch (e) { console.warn(e); }
   }, 120);
-  el.speedSlider.addEventListener("input", postSpeedConfig);
 
-  // Live hyperparameters -> /api/update_config
-  const postConfigUpdate = debounce(async (payload) => {
-    await restPost("/api/update_config", payload);
-  }, 120);
+  if (el.speedSlider) {
+    el.speedSlider.addEventListener("input", () => {
+      const v = Number(el.speedSlider.value) | 0;
+      if (el.speedVal) el.speedVal.textContent = String(v);
+      postSpeedConfig();
+    });
+  }
 
   function liveBind(sliderEl, labelEl, formatFn, sendFn) {
     const ff = (v) => (formatFn ? formatFn(v) : v);
@@ -447,26 +637,20 @@
       const cfg = await restGet("/api/config");
       if (cfg?.board?.w && cfg?.board?.h){
         board.w=cfg.board.w; board.h=cfg.board.h;
-        // reflect select
         const opt = [5,8,10,12,20].includes(board.w) ? String(board.w) : "20";
         el.gridSize.value = opt;
       }
       if (cfg?.step_delay_ms !== undefined) {
         el.speedSlider.value = String(cfg.step_delay_ms|0);
-        el.speedVal.textContent = String(cfg.step_delay_ms|0);
+        if (el.speedVal) el.speedVal.textContent = String(cfg.step_delay_ms|0);
+      }
+      if (cfg?.algorithm) {
+        el.algoSelect.value = String(cfg.algorithm);
       }
     }catch{}
-    buildGridCache(); drawGrid(); initCharts(); drawNeuralDiagram(); connectWS(); requestAnimationFrame(rafLoop);
-
-    // default view = neural
+    buildGridCache(); drawGrid(); drawNeuralDiagram(); connectWS(); requestAnimationFrame(rafLoop);
     selectView("neural");
   }
   bootstrap();
 
-  // optional helper
-  window.SnakeUI = window.SnakeUI || {};
-  window.SnakeUI.setLLM = (enabled, freq=1000) => fetch(`${CONFIG.API_URL}/api/update_config`, {
-    method: "POST", headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({ llm: { enabled, freq } })
-  });
 })();

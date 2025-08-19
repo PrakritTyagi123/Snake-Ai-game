@@ -1,0 +1,41 @@
+Snake-Ai-game
+    │   LICENSE
+    │   README.md
+    │   requirements.txt
+    │   run_uvicorn.ps1
+    │   start.py
+    │   tree.txt
+    │
+    ├───ai_chatmodel
+    ├───backend
+    │   │   app.py
+    │   │   config.py
+    │   │   llm.py
+    │   │
+    │   ├───agent
+    │   │       ddqn.py
+    │   │       replay_buffer.py
+    │   │       __init__.py
+    │   │
+    │   ├───env
+    │   │       snake_env.py
+    │   │       __init__.py
+    │   │
+    │   ├───explain
+    │   │       __init__.py
+    │   │
+    │   ├───storage
+    │   │   │   __init__.py
+    │   │   │
+    │   │   └───checkpoints
+    │   └───train
+    │           loop.py
+    │           __init__.py
+    │
+    ├───frontend
+    │       index.html
+    │       script.js
+    │       style.css
+    │
+    └───storage
+        └───checkpoints
