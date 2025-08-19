@@ -1,556 +1,662 @@
+# backend/train/loop.py
 from __future__ import annotations
-import time, threading, csv, os, json, asyncio, tempfile, queue
-from typing import Optional, Dict, Any, List
+
+import asyncio
+import queue
+import threading
+import time
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
 
 import torch
+from openpyxl import Workbook, load_workbook  # for episode logging
 
-from ..config import (
-    DEFAULT_MAX_EPISODES, DEFAULT_MAX_STEPS, DEFAULT_GAMMA, DEFAULT_LR, DEFAULT_BATCH,
-    DEFAULT_EPS_START, DEFAULT_EPS_MIN, DEFAULT_EPS_DECAY, TARGET_UPDATE_FREQ,
-    CHECKPOINT_DIR, LOG_DIR, BOARD_WIDTH, BOARD_HEIGHT, WIN_LENGTH, REQUIRE_CUDA, STEP_DELAY_MS,
-)
-from .. import config as cfg
-from ..env.snake_env import SnakeEnv
-from ..agent.ddqn import DDQNAgent
-from ..agent.replay_buffer import ReplayBuffer
+# ---------------- Project imports (robust) ----------------
+# Prefer package-relative imports (backend is a package). Fall back if needed.
 try:
-    from ..llm import LLMReporter  # if llm.py is inside backend/
-except ImportError:
-    from llm import LLMReporter    # if llm.py is at project root
+    from .. import config as cfg  # type: ignore
+except Exception:  # pragma: no cover
+    import config as cfg  # type: ignore
+
+try:
+    from ..env.snake_env import SnakeEnv  # type: ignore
+    from ..agent.ddqn import DDQNAgent  # type: ignore
+    from ..agent.replay_buffer import ReplayBuffer  # type: ignore
+except Exception:  # pragma: no cover
+    from env.snake_env import SnakeEnv  # type: ignore
+    from agent.ddqn import DDQNAgent  # type: ignore
+    from agent.replay_buffer import ReplayBuffer  # type: ignore
+
+try:
+    from ..llm import LLMReporter  # type: ignore
+except Exception:  # pragma: no cover
+    try:
+        from llm import LLMReporter  # type: ignore
+    except Exception:
+        LLMReporter = None  # type: ignore
 
 
-class BroadcastManager:
-    def __init__(self, loop: asyncio.AbstractEventLoop | None):
-        self.loop = loop
-        self.conns: List[Any] = []
-        self._lock = threading.Lock()
+# ---------------- Tunables / constants ----------------
+VISUAL_STRIDE = 3       # send a state_frame every N steps (reduce WS/DOM load)
+NN_STRIDE = 20          # send nn_activations every N steps
+LLM_QUEUE_MAX = 8       # max pending commentary snapshots
 
-    async def _broadcast(self, payload: Dict[str, Any]):
-        dead = []
-        for ws in list(self.conns):
-            try:
-                await ws.send_json(payload)
-            except Exception:
-                dead.append(ws)
-        if dead:
-            with self._lock:
-                for d in dead:
-                    if d in self.conns:
-                        self.conns.remove(d)
-
-    def broadcast(self, payload: Dict[str, Any]):
-        if not self.loop:
-            return
-        asyncio.run_coroutine_threadsafe(self._broadcast(payload), self.loop)
+EPISODES_HEADERS = [
+    "episode", "outcome", "reason", "score", "snake_length", "epsilon",
+    "avg_loss", "steps", "duration_ms", "timestamp", "algorithm", "grid_w", "grid_h"
+]
 
 
-# ------------------ async/light checkpointer ------------------
-class AsyncCheckpointer:
-    def __init__(self, trainer: "Trainer"):
-        self.trainer = trainer
-        self.q: "queue.Queue[tuple[str,int|None]]" = queue.Queue(maxsize=1)
-        self._last_auto_ts = 0.0
-        self._th = threading.Thread(target=self._worker, daemon=True)
-        self._th.start()
+def _device() -> str:
+    # Only require CUDA if explicitly requested via config
+    if getattr(cfg, "REQUIRE_CUDA", 0) and not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA GPU required but not available. "
+            "Set REQUIRE_CUDA=0 in config.py (or env) to bypass."
+        )
+    return "cuda" if torch.cuda.is_available() else "cpu"
 
-    def request_auto(self, total_steps: int):
-        min_gap = float(self.trainer.params.get("autosave_interval_s", 3.0))
-        now = time.time()
-        if now - self._last_auto_ts < min_gap:
-            return
-        self._last_auto_ts = now
-        self._offer(("auto", total_steps))
 
-    def _offer(self, item: tuple[str, int | None]):
-        try:
-            while True:
-                self.q.get_nowait()
-        except queue.Empty:
-            pass
-        try:
-            self.q.put_nowait(item)
-        except queue.Full:
-            pass
+def _algo_filename(s: str) -> str:
+    return f"{(s or 'ddqn').strip().lower()}.ckpt"
 
-    def _worker(self):
-        while True:
-            kind, total_steps = self.q.get()
-            try:
-                if kind == "auto":
-                    ckpt = self.trainer._compose_light_checkpoint()
-                    path = os.path.join(CHECKPOINT_DIR, "latest_auto.ckpt")
-                    self.trainer._write_ckpt_to_path(ckpt, path, make_latest=False)
-                    self.trainer.b.broadcast({
-                        "type": "checkpoint_saved", "path": os.path.basename(path),
-                        "total_steps": int(total_steps or self.trainer.total_steps),
-                        "mode": "light"
-                    })
-            except Exception as e:
-                self.trainer.b.broadcast({"type": "checkpoint_error", "error": str(e)})
+
+@dataclass
+class EpsilonCfg:
+    start: float = getattr(cfg, "DEFAULT_EPS_START", 1.0)
+    min: float = getattr(cfg, "DEFAULT_EPS_MIN", 0.05)
+    decay: float = getattr(cfg, "DEFAULT_EPS_DECAY", 0.995)
+
+
+@dataclass
+class LLMConfig:
+    enabled: bool = bool(getattr(cfg, "LLM_ENABLED", 1))
+    freq: int = int(getattr(cfg, "LLM_COMMENT_FREQ", 1000))
+    backend: str = str(getattr(cfg, "LLM_BACKEND", "hf")).lower()
+    model_id: str = str(getattr(cfg, "LLM_MODEL_HF_ID", "Qwen/Qwen2-0.5B-Instruct"))
+    local_dir: str = str(getattr(cfg, "LLM_LOCAL_DIR", "ai_chatmodel/Qwen2-0.5B-Instruct"))
+    max_tokens: int = int(getattr(cfg, "LLM_MAX_TOKENS", 250))
+
+
+@dataclass
+class TrainerParams:
+    # Algo / training
+    algorithm: str = "DDQN"
+    gamma: float = getattr(cfg, "DEFAULT_GAMMA", 0.95)
+    lr: float = getattr(cfg, "DEFAULT_LR", 1e-3)
+    batch_size: int = getattr(cfg, "DEFAULT_BATCH", 64)
+    max_episodes: int = getattr(cfg, "DEFAULT_MAX_EPISODES", 0)  # 0 => endless
+    max_steps: int = getattr(cfg, "DEFAULT_MAX_STEPS", 1000)
+
+    # Board
+    board: Dict[str, int] = field(
+        default_factory=lambda: {
+            "w": getattr(cfg, "BOARD_WIDTH", 20),
+            "h": getattr(cfg, "BOARD_HEIGHT", 20),
+        }
+    )
+    win_length: int = getattr(
+        cfg,
+        "WIN_LENGTH",
+        (getattr(cfg, "BOARD_WIDTH", 20) * getattr(cfg, "BOARD_HEIGHT", 20)) - 1,
+    )
+
+    # Live controls
+    step_delay_ms: int = getattr(cfg, "STEP_DELAY_MS", 0)
+    epsilon: EpsilonCfg = field(default_factory=EpsilonCfg)
+
+    # Misc
+    target_update_freq: int = getattr(cfg, "TARGET_UPDATE_FREQ", 250)
+    llm: LLMConfig = field(default_factory=LLMConfig)
 
 
 class Trainer:
-    def __init__(self, broadcaster: BroadcastManager):
-        self.b = broadcaster
-        self.training_thread: Optional[threading.Thread] = None
-        self._stop = threading.Event()
-        self._pause = threading.Event()
-        self._running = False
-        self.history: List[Dict[str, Any]] = []
+    """
+    Full trainer:
+      - streams frames/metrics over a broadcaster
+      - runs DDQN training
+      - NO autosave; saves only on pause/close or explicit /api/save
+      - single checkpoint file per algo: storage/checkpoints/<algo>.ckpt
+      - episode summaries are appended to storage/episodes/<algo>.xlsx
+    """
+    def __init__(self, async_broadcast: Callable[[Dict[str, Any]], Any]):
+        self.params = TrainerParams()
+        self._broadcast_async = async_broadcast
 
-        # ----- env / agent -----
-        self.env = SnakeEnv(BOARD_WIDTH, BOARD_HEIGHT, WIN_LENGTH, seed=0)
-        state_dim = len(self.env.get_state())
-        if REQUIRE_CUDA and not torch.cuda.is_available():
-            raise RuntimeError("CUDA GPU required but not available.")
+        # Async loop to drive the (possibly) async broadcaster from a background thread
+        self._loop = asyncio.new_event_loop()
+        self._loop_th = threading.Thread(target=self._run_loop, daemon=True)
+        self._loop_th.start()
 
-        self.agent = DDQNAgent(state_dim, 4, lr=DEFAULT_LR, gamma=DEFAULT_GAMMA, device="cuda")
-        self.buffer = ReplayBuffer(100_000, seed=0)
+        # Runtime flags
+        self._th: Optional[threading.Thread] = None
+        self._stop_evt = threading.Event()
+        self._pause_evt = threading.Event()
+        self._lock = threading.Lock()
+        self.closing = False  # when True, stop emitting late WS messages
 
-        # ----- params (runtime editable) -----
-        base_local_dir = os.getenv("LLM_LOCAL_DIR", getattr(cfg, "LLM_LOCAL_DIR", None))
-        self.params = {
-            "algorithm": "DDQN",
-            "max_episodes": DEFAULT_MAX_EPISODES,   # <=0 → run forever
-            "max_steps": DEFAULT_MAX_STEPS,         # 0 → unlimited
-            "gamma": DEFAULT_GAMMA,
-            "lr": DEFAULT_LR,
-            "batch_size": DEFAULT_BATCH,
-            "epsilon": {"start": DEFAULT_EPS_START, "min": DEFAULT_EPS_MIN, "decay": DEFAULT_EPS_DECAY},
-            "step_delay_ms": STEP_DELAY_MS,
-            "autosave_steps": getattr(cfg, "DEFAULT_AUTOSAVE_STEPS", 1000),
-            "autosave_interval_s": 3.0,
-            "autosave_light": True,
-            "llm": {
-                "enabled": bool(getattr(cfg, "LLM_ENABLED", True)),
-                "freq": int(getattr(cfg, "LLM_COMMENT_FREQ", 1000)),
-                "backend": str(getattr(cfg, "LLM_BACKEND", "hf")).lower(),
-                "model_id": str(getattr(cfg, "LLM_MODEL_HF_ID", "Qwen/Qwen2-0.5B-Instruct")),
-                "local_dir": base_local_dir,
-                "max_tokens": int(getattr(cfg, "LLM_MAX_TOKENS", 250)),
-            },
-        }
+        # Stats
+        self.total_steps: int = 0
+        self.episode: int = 0
+        self._eps_value: float = self.params.epsilon.start
 
-        self.total_steps = 0
-        self._eps_override: Optional[float] = None
+        # RL components
+        self.device = _device()
+        self.env = SnakeEnv(self.params.board["w"], self.params.board["h"], self.params.win_length)
+        state = self.env.reset()
+        self.state_dim = len(state)
+        self.agent = DDQNAgent(self.state_dim, out_dim=4, lr=self.params.lr, gamma=self.params.gamma, device=self.device)
+        self.buffer = ReplayBuffer(capacity=100_000, seed=0)
 
-        # pending env resize
-        self._pending_board: Optional[tuple[int,int]] = None
-        self._force_ep_end = False
+        # Episode logging buffer
+        self._episodes_buf: List[Dict[str, Any]] = []
+        self._episodes_lock = threading.Lock()
 
-        # ----- LLM reporter -----
-        self.llm = LLMReporter(
-            backend=self.params["llm"]["backend"],
-            model_id=self.params["llm"]["model_id"],
-            local_dir=self.params["llm"]["local_dir"],
-            max_tokens=self.params["llm"]["max_tokens"],
-        )
-        self._llm_busy = False
-
-        # ----- async saver -----
-        self._saver = AsyncCheckpointer(self)
-
-    # -------- control --------
-    def start(self, params: Optional[Dict[str, Any]] = None):
-        if params:
-            self.params.update(params)
-            if params.get("reset_epsilon", False):
-                self._eps_override = self.params["epsilon"]["start"]
-            if "algorithm" in params:
-                self.params["algorithm"] = str(params["algorithm"]).upper()
-        if self._running:
-            return
-        self._stop.clear()
-        self._pause.clear()
-        self.training_thread = threading.Thread(target=self._train_loop, daemon=True)
-        self.training_thread.start()
-        self._running = True
-
-    def pause(self): self._pause.set()
-    def resume(self): self._pause.clear()
-    def stop(self): self._stop.set(); self._running = False
-    def reset_env(self): self.env.reset()
-
-    # -------- checkpoint composition/writing --------
-    def _compose_light_checkpoint(self) -> Dict[str, Any]:
-        try:
-            scaler_state = getattr(self.agent, "scaler", None)
-            scaler_state = scaler_state.state_dict() if scaler_state is not None else None
-        except Exception:
-            scaler_state = None
-        return {
-            "agent": {
-                "policy": {k: v.detach().cpu() for k, v in self.agent.policy.state_dict().items()},
-                "target": {k: v.detach().cpu() for k, v in self.agent.target.state_dict().items()},
-                "opt": self.agent.optimizer.state_dict(),
-                "scaler": scaler_state,
-            },
-            "trainer": {
-                "total_steps": self.total_steps,
-                "epsilon": self._eps_override,
-                "params": self.params,
-            },
-            "buffer": None,
-            "meta": {"ts": int(time.time()), "algo": self.params.get("algorithm","DDQN"), "version": 2, "kind": "light"},
-        }
-
-    def _compose_checkpoint(self) -> Dict[str, Any]:
-        try:
-            scaler_state = getattr(self.agent, "scaler", None)
-            scaler_state = scaler_state.state_dict() if scaler_state is not None else None
-        except Exception:
-            scaler_state = None
-        return {
-            "agent": {
-                "policy": self.agent.policy.state_dict(),
-                "target": self.agent.target.state_dict(),
-                "opt": self.agent.optimizer.state_dict(),
-                "scaler": scaler_state,
-            },
-            "trainer": {
-                "total_steps": self.total_steps,
-                "epsilon": self._eps_override,
-                "params": self.params,
-            },
-            "buffer": self.buffer.state_dict(),
-            "meta": {"ts": int(time.time()), "algo": self.params.get("algorithm","DDQN"), "version": 2, "kind": "full"},
-        }
-
-    def _write_ckpt_to_path(self, ckpt: Dict[str, Any], path: str, make_latest: bool = True) -> str:
-        os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-        fd, tmp_path = tempfile.mkstemp(dir=CHECKPOINT_DIR, prefix="._tmp_", suffix=".ckpt")
-        os.close(fd)
-        torch.save(ckpt, tmp_path, pickle_protocol=4, _use_new_zipfile_serialization=False)
-        os.replace(tmp_path, path)
-        if make_latest:
-            latest = os.path.join(CHECKPOINT_DIR, "latest.ckpt")
+        # --- LLM (non-blocking worker), hard-disable aware ---
+        hard_off = bool(getattr(cfg, "LLM_HARD_DISABLE", 0))
+        if hard_off:
             try:
-                if os.path.exists(latest): os.remove(latest)
-                os.link(path, latest)
+                self.params.llm.enabled = False
             except Exception:
-                try:
-                    import shutil; shutil.copy2(path, latest)
-                except Exception:
-                    pass
-        return path
+                pass
 
-    def save(self):
-        path = os.path.join(CHECKPOINT_DIR, f"trainer_{int(time.time())}.ckpt")
-        final = self._write_ckpt_to_path(self._compose_checkpoint(), path, make_latest=True)
-        return {"ok": True, "path": final}
+        self._llm: Optional[Any] = None  # keep typing simple even if llm import fails
+        self._llm_last_step = 0
+        self._llm_q: "queue.Queue[Optional[Dict[str, Any]]]" = queue.Queue(maxsize=LLM_QUEUE_MAX)
+        self._llm_stop_evt = threading.Event()
+        self._llm_th: Optional[threading.Thread] = None
 
-    def load(self, path: Optional[str] = None):
-        def _pick_latest():
-            files = []
-            for f in os.listdir(CHECKPOINT_DIR):
-                if f.endswith(('.ckpt', '.pth')):
-                    files.append(os.path.join(CHECKPOINT_DIR, f))
-            if not files: return None
-            files.sort(key=lambda p: os.path.getmtime(p))
-            return files[-1]
+        # start worker only if enabled
+        if bool(self.params.llm.enabled):
+            self._llm_th = threading.Thread(target=self._llm_worker, daemon=True)
+            self._llm_th.start()
 
-        if not path:
-            path = _pick_latest()
-            if not path:
-                return {"ok": False, "error": "no checkpoint found"}
+        self._maybe_init_llm()
 
+    # ---------- asyncio bridge ----------
+    def _run_loop(self):
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_forever()
+
+    def _emit(self, payload: Dict[str, Any]) -> None:
+        if self.closing:
+            return
         try:
-            loaded = torch.load(path, map_location="cuda" if torch.cuda.is_available() else "cpu")
-        except Exception as e:
-            return {"ok": False, "error": f"load failed: {e}"}
-
-        if isinstance(loaded, dict) and ("agent" in loaded or "policy" in loaded):
-            if "agent" in loaded:
-                agent = loaded["agent"]
-                self.agent.policy.load_state_dict(agent["policy"])
-                self.agent.target.load_state_dict(agent["target"])
-                self.agent.optimizer.load_state_dict(agent["opt"])
-                if agent.get("scaler") and getattr(self.agent, "scaler", None) is not None:
-                    try: self.agent.scaler.load_state_dict(agent["scaler"])
-                    except Exception: pass
-
-                tr = loaded.get("trainer", {})
-                self.total_steps = int(tr.get("total_steps", 0))
-                self._eps_override = tr.get("epsilon", None)
-                if isinstance(tr.get("params"), dict):
-                    self.params.update(tr["params"])
-
-                buf = loaded.get("buffer", None)
-                if isinstance(buf, dict):
-                    self.buffer.load_state_dict(buf)
-                return {"ok": True, "path": path, "resumed": True}
-            else:
-                try:
-                    self.agent.policy.load_state_dict(loaded["policy"])
-                    self.agent.target.load_state_dict(loaded["target"])
-                    self.agent.optimizer.load_state_dict(loaded["opt"])
-                except Exception:
-                    return {"ok": False, "error": "invalid legacy checkpoint"}
-                return {"ok": True, "path": path, "resumed": False}
-
-        try:
-            self.agent.load(path)
-            return {"ok": True, "path": path, "resumed": False}
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
-
-    # -------- live config (sliders + algorithm + board) --------
-    def update_config(self, cfg: Dict[str, Any]):
-        if "algorithm" in cfg:
-            try: self.params["algorithm"] = str(cfg["algorithm"]).upper()
-            except Exception: pass
-
-        if "board" in cfg and isinstance(cfg["board"], dict):
-            w = int(cfg["board"].get("w", 0)); h = int(cfg["board"].get("h", 0))
-            if w == h and w in (5, 8, 10, 12, 20):
-                self._pending_board = (w, h)
-                self._force_ep_end = True  # end the current episode quickly to apply
-                # pre-announce (frontend will update grid visuals, then final confirmation after apply)
-                try:
-                    self.b.broadcast({"type": "config_applied", "params": {"board": {"w": w, "h": h}}})
-                except Exception:
-                    pass
-
-        if "step_delay_ms" in cfg:
-            try: self.params["step_delay_ms"] = int(cfg["step_delay_ms"])
-            except Exception: pass
-        if "max_steps" in cfg:
-            try: self.params["max_steps"] = int(cfg["max_steps"])
-            except Exception: pass
-        if "batch_size" in cfg:
-            try: self.params["batch_size"] = int(cfg["batch_size"])
-            except Exception: pass
-        if "autosave_steps" in cfg:
-            try: self.params["autosave_steps"] = int(cfg["autosave_steps"])
-            except Exception: pass
-        if "autosave_interval_s" in cfg:
-            try: self.params["autosave_interval_s"] = float(cfg["autosave_interval_s"])
-            except Exception: pass
-        if "autosave_light" in cfg:
-            try: self.params["autosave_light"] = bool(cfg["autosave_light"])
-            except Exception: pass
-
-        if "lr" in cfg:
-            try:
-                new_lr = float(cfg["lr"]); self.params["lr"] = new_lr
-                for g in self.agent.optimizer.param_groups: g["lr"] = new_lr
-            except Exception: pass
-        if "gamma" in cfg:
-            try:
-                g = float(cfg["gamma"]); self.params["gamma"] = g
-                if hasattr(self.agent, "gamma"): self.agent.gamma = g
-            except Exception: pass
-
-        if "epsilon" in cfg and isinstance(cfg["epsilon"], dict):
-            e = cfg["epsilon"]
-            if "start" in e:
-                try: self.params["epsilon"]["start"] = float(e["start"])
-                except Exception: pass
-            if "min" in e:
-                try: self.params["epsilon"]["min"] = float(e["min"])
-                except Exception: pass
-            if "decay" in e:
-                try: self.params["epsilon"]["decay"] = float(e["decay"])
-                except Exception: pass
-            if "value" in e:
-                try: self._eps_override = float(e["value"])
-                except Exception: pass
-        if "epsilon_value" in cfg:
-            try: self._eps_override = float(cfg["epsilon_value"])
-            except Exception: pass
-
-        if "llm" in cfg and isinstance(cfg["llm"], dict):
-            L = cfg["llm"]
-            if "enabled" in L: self.params["llm"]["enabled"] = bool(L["enabled"])
-            if "freq" in L:
-                try: self.params["llm"]["freq"] = max(1, int(L["freq"]))
-                except Exception: pass
-            if "backend" in L and L["backend"]:
-                self.params["llm"]["backend"] = str(L["backend"]).lower()
-            if "model_id" in L and L["model_id"]:
-                self.params["llm"]["model_id"] = str(L["model_id"])
-            if "local_dir" in L and L["local_dir"]:
-                self.params["llm"]["local_dir"] = str(L["local_dir"])
-            if "max_tokens" in L:
-                try: self.params["llm"]["max_tokens"] = int(L["max_tokens"])
-                except Exception: pass
-            self.llm = LLMReporter(
-                backend=self.params["llm"]["backend"],
-                model_id=self.params["llm"]["model_id"],
-                local_dir=self.params["llm"]["local_dir"],
-                max_tokens=self.params["llm"]["max_tokens"],
-            )
-
-        # general echo (includes algorithm + autosave fields)
-        try:
-            w = getattr(self.env, "w", None) or getattr(self.env, "width", None)
-            h = getattr(self.env, "h", None) or getattr(self.env, "height", None)
-            self.b.broadcast({"type": "config_applied", "params": {
-                "algorithm": self.params.get("algorithm", "DDQN"),
-                "lr": self.params["lr"], "gamma": self.params["gamma"],
-                "batch_size": self.params["batch_size"], "max_steps": self.params["max_steps"],
-                "step_delay_ms": self.params["step_delay_ms"], "autosave_steps": self.params["autosave_steps"],
-                "autosave_interval_s": self.params["autosave_interval_s"], "autosave_light": self.params["autosave_light"],
-                "epsilon_value": self._eps_override if self._eps_override is not None else "auto",
-                "epsilon_min": self.params["epsilon"]["min"], "epsilon_decay": self.params["epsilon"]["decay"],
-                "llm": self.params.get("llm", {}),
-                "board": {"w": w, "h": h},
-            }})
+            fut = self._broadcast_async(payload)
+            if asyncio.iscoroutine(fut):
+                asyncio.run_coroutine_threadsafe(fut, self._loop)
         except Exception:
             pass
 
-        return {"ok": True, **self.params, "epsilon_value": self._eps_override if self._eps_override is not None else "auto"}
+    # ---------- config ----------
+    def get_config(self) -> Dict[str, Any]:
+        p = asdict(self.params)
+        p["epsilon"] = asdict(self.params.epsilon)
+        p["llm"] = asdict(self.params.llm)
+        return p
 
-    # -------- LLM helper --------
-    def _kickoff_llm_comment(self, episode: int, step: int, epsilon: float, avg_loss: float, score_so_far: int, q_values):
-        if self._llm_busy or not self.params["llm"]["enabled"]:
-            return
-        self._llm_busy = True
+    def update_config(self, patch: Dict[str, Any]) -> Dict[str, Any]:
+        if not patch:
+            return {"ok": True, "params": self.get_config()}
+        with self._lock:
+            # Track changes that need live-application to the agent
+            lr_changed = ("lr" in patch and patch["lr"] is not None)
+            gamma_changed = ("gamma" in patch and patch["gamma"] is not None)
+            eps_start_changed = False
+            eps_min_changed = False
 
-        recent = list(self.history[-10:])
-        snap = {
-            "step": int(step),
-            "episode": int(episode),
-            "epsilon": float(epsilon),
-            "avg_loss": float(avg_loss),
-            "score_so_far": int(score_so_far),
-            "recent": recent[::-1],
-            "q_values": [float(x) for x in (q_values or [])][:4] if q_values is not None else None,
-        }
+            # Simple scalar fields copied into params
+            for k in ("algorithm", "lr", "gamma", "batch_size", "max_episodes",
+                      "max_steps", "step_delay_ms", "target_update_freq"):
+                if k in patch and patch[k] is not None:
+                    setattr(self.params, k, patch[k])
 
-        def worker():
-            try:
-                text = self.llm.generate_comment(snap)
-            except Exception:
-                text = "LLM commentary unavailable."
-            try:
-                self.b.broadcast({"type": "llm_comment", "episode": episode, "step": step, "text": text})
-            finally:
-                self._llm_busy = False
+            # Epsilon nested
+            if "epsilon" in patch and isinstance(patch["epsilon"], dict):
+                ep = patch["epsilon"]
+                if "start" in ep and ep["start"] is not None:
+                    setattr(self.params.epsilon, "start", float(ep["start"]))
+                    eps_start_changed = True
+                if "min" in ep and ep["min"] is not None:
+                    setattr(self.params.epsilon, "min", float(ep["min"]))
+                    eps_min_changed = True
+                if "decay" in ep and ep["decay"] is not None:
+                    setattr(self.params.epsilon, "decay", float(ep["decay"]))
 
-        threading.Thread(target=worker, daemon=True).start()
+                # REAL-TIME epsilon behavior:
+                if eps_start_changed:
+                    self._eps_value = float(self.params.epsilon.start)
+                if eps_min_changed:
+                    self._eps_value = max(float(self.params.epsilon.min), float(self._eps_value))
 
-    # -------- training --------
-    def _train_loop(self):
-        eps = self._eps_override if self._eps_override is not None else self.params["epsilon"]["start"]
+            # Board change → rebuild env (next frame)
+            if "board" in patch and isinstance(patch["board"], dict):
+                w = int(patch["board"].get("w", self.params.board["w"]))
+                h = int(patch["board"].get("h", self.params.board["h"]))
+                if w != self.params.board["w"] or h != self.params.board["h"]:
+                    self.params.board["w"] = w
+                    self.params.board["h"] = h
+                    self.params.win_length = w * h - 1
+                    self.env = SnakeEnv(w, h, self.params.win_length)
+                    self._emit({"type": "board_changed", "board": {"w": w, "h": h}})
 
-        self.env.reset()
-        csv_path = os.path.join(LOG_DIR, "episodes.csv")
-        os.makedirs(os.path.dirname(csv_path), exist_ok=True)
-        csv_file = open(csv_path, "a", newline="", encoding="utf-8")
-        csv_writer = csv.writer(csv_file)
-        if csv_file.tell() == 0:
-            csv_writer.writerow(["episode","outcome","reason","score","snake_length","epsilon","avg_loss","steps","duration_ms","timestamp"])
-
-        ep = 1
-        max_ep = self.params["max_episodes"]
-        infinite = (max_ep is None) or (max_ep <= 0)
-
-        while infinite or ep <= max_ep:
-            # apply pending board resize at episode boundary
-            if self._pending_board:
-                w, h = self._pending_board
-                self.env = SnakeEnv(w, h, WIN_LENGTH, seed=0)
-                self._pending_board = None
+            # ---- LIVE-APPLY LR and GAMMA to the agent immediately ----
+            if lr_changed and hasattr(self, "agent") and hasattr(self.agent, "optimizer"):
                 try:
-                    self.b.broadcast({"type": "board_changed", "board": {"w": w, "h": h}})
+                    new_lr = float(self.params.lr)
+                    for g in self.agent.optimizer.param_groups:
+                        g["lr"] = new_lr
                 except Exception:
                     pass
 
-            if self._stop.is_set(): break
-            while self._pause.is_set():
-                time.sleep(0.1)
-                if self._stop.is_set(): break
-            if self._stop.is_set(): break
+            if gamma_changed and hasattr(self, "agent"):
+                try:
+                    setattr(self.agent, "gamma", float(self.params.gamma))
+                except Exception:
+                    pass
 
-            state = self.env.reset()
-            ep_loss_sum = 0.0; ep_loss_count = 0; score = 0; t0 = time.time(); step = 1
+            # LLM changes (respect hard-disable, start/stop worker on demand)
+            if "llm" in patch and isinstance(patch["llm"], dict):
+                if bool(getattr(cfg, "LLM_HARD_DISABLE", 0)):
+                    try:
+                        setattr(self.params.llm, "enabled", False)
+                    except Exception:
+                        pass
+                else:
+                    for lk in ("enabled", "freq", "backend", "model_id", "local_dir", "max_tokens"):
+                        if lk in patch["llm"]:
+                            setattr(self.params.llm, lk, patch["llm"][lk])
+                    # start/stop worker if toggled
+                    try:
+                        if self.params.llm.enabled and self._llm_th is None:
+                            self._llm_th = threading.Thread(target=self._llm_worker, daemon=True)
+                            self._llm_th.start()
+                        elif (not self.params.llm.enabled) and self._llm_th:
+                            self._llm_stop_evt.set()
+                            try:
+                                self._llm_q.put_nowait(None)
+                            except Exception:
+                                pass
+                            if self._llm_th.is_alive():
+                                self._llm_th.join(timeout=1.0)
+                            self._llm_th = None
+                    except Exception:
+                        pass
+                self._maybe_init_llm()
 
-            while True:
-                if self._stop.is_set() or self._pause.is_set(): break
-                if self._force_ep_end:
-                    # end this episode quickly to apply changes
-                    self._force_ep_end = False
-                    info = {"outcome": "LOSS", "reason": "board_resize"}
-                    break
+        # Let UI know the currently applied params (and live epsilon value)
+        self._emit({"type": "config_applied", "params": self.get_config(), "epsilon_current": self._eps_value})
+        return {"ok": True, "params": self.get_config()}
 
-                cur_max_steps = int(self.params.get("max_steps", 0))
-                if cur_max_steps > 0 and step > cur_max_steps: break
+    def _maybe_init_llm(self):
+        # Respect hard disable and availability
+        if bool(getattr(cfg, "LLM_HARD_DISABLE", 0)):
+            self._llm = None
+            return
+        if not LLMReporter or not bool(self.params.llm.enabled):
+            self._llm = None
+            return
+        try:
+            self._llm = LLMReporter(
+                backend=self.params.llm.backend,
+                model_id=self.params.llm.model_id,
+                local_dir=self.params.llm.local_dir,
+                max_tokens=self.params.llm.max_tokens
+            )
+        except Exception:
+            self._llm = None
 
-                delay = int(self.params.get("step_delay_ms", 0))
-                if delay > 0: time.sleep(delay/1000.0)
+    # ---------- LLM worker ----------
+    def _llm_worker(self):
+        """Background thread: turns snapshots into commentary without blocking training."""
+        while not self._llm_stop_evt.is_set():
+            try:
+                item = self._llm_q.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            if item is None:
+                break  # sentinel
+            if self.closing or not self._llm:
+                continue
+            try:
+                text = self._llm.generate_comment(item)
+                if text:
+                    self._emit({
+                        "type": "llm_comment",
+                        "episode": item.get("episode", 0),
+                        "step": item.get("step", 0),
+                        "text": text
+                    })
+            except Exception:
+                # commentary must never break training
+                pass
 
-                action = self.agent.act(state, eps)
-                next_state, reward, done, info = self.env.step(action)
-                self.buffer.push(state, action, reward, next_state, done)
-                state = next_state
-                score += (1 if reward > 0.5 else 0)
+    # ---------- lifecycle ----------
+    def start(self) -> None:
+        if self._th and self._th.is_alive():
+            return
+        self._stop_evt.clear()
+        self._pause_evt.clear()
+        self.closing = False
+        self._th = threading.Thread(target=self._train_loop, daemon=True)
+        self._th.start()
 
-                batch = int(self.params.get("batch_size", DEFAULT_BATCH))
-                if len(self.buffer) >= batch:
-                    batch_data = self.buffer.sample(batch)
-                    target_update = (self.total_steps % TARGET_UPDATE_FREQ == 0)
-                    loss = self.agent.learn(batch_data, target_net_update=target_update)
-                    ep_loss_sum += loss; ep_loss_count += 1
+    def resume(self) -> None:
+        self._pause_evt.clear()
+        self._emit({"type": "metrics_tick", "episode": self.episode, "step": self.total_steps})
 
-                if self.total_steps % 3 == 0:
-                    self.b.broadcast({"type":"state_frame", "grid": self.env.render_spec(), "step": self.total_steps, "episode": ep})
-                    acts = self.agent.activation_summary(); q = self.agent.q_values(state)
-                    self.b.broadcast({"type":"nn_activations", "layers":[
-                        {"name":"dense1","act":acts.get("dense1", [])},
-                        {"name":"dense2","act":acts.get("dense2", [])},
-                        {"name":"output","q":q}
-                    ], "chosen_action": ["Up","Down","Left","Right"][action]})
-                    self.b.broadcast({"type":"metrics_tick", "episode": ep, "step": step, "epsilon": eps,
-                                       "rolling_loss": (ep_loss_sum/max(1,ep_loss_count)) if ep_loss_count else 0.0,
-                                       "score_so_far": score})
+    def stop(self) -> None:
+        self._stop_evt.set()
 
-                self.total_steps += 1
+    def reset(self) -> None:
+        self.total_steps = 0
+        self.episode = 0
+        self._eps_value = self.params.epsilon.start
+        self.env = SnakeEnv(self.params.board["w"], self.params.board["h"], self.params.win_length)
+        self.env.reset()
+        self.buffer = ReplayBuffer(capacity=100_000, seed=0)
+        self._emit({"type": "config_applied", "params": self.get_config()})
 
-                # async LIGHT autosave
-                autosave_steps = int(self.params.get("autosave_steps", 0))
-                if autosave_steps > 0 and (self.total_steps % autosave_steps == 0) and self.params.get("autosave_light", True):
-                    self._saver.request_auto(self.total_steps)
+    async def pause_and_save(self) -> None:
+        self._pause_evt.set()
+        await asyncio.sleep(0.01)  # let loop yield
+        await self.save_checkpoint(reason="pause")
 
-                # LLM commentary trigger
-                llm_cfg = self.params.get("llm", {})
-                freq = int(llm_cfg.get("freq", 0))
-                if llm_cfg.get("enabled", False) and freq > 0 and (self.total_steps % freq == 0):
-                    rolling_loss = (ep_loss_sum/max(1,ep_loss_count)) if ep_loss_count else 0.0
-                    q_vals = None
-                    try: q_vals = self.agent.q_values(state)
-                    except Exception: pass
-                    self._kickoff_llm_comment(ep, self.total_steps, eps, rolling_loss, score, q_vals)
+    def shutdown(self) -> None:
+        """Stop training thread, LLM worker, flush logs, and internal asyncio loop cleanly."""
+        # stop training
+        try:
+            self._stop_evt.set()
+            self._pause_evt.set()
+            if self._th and self._th.is_alive():
+                self._th.join(timeout=1.0)
+        except Exception:
+            pass
+        # flush episode log
+        try:
+            self.flush_episode_log()
+        except Exception:
+            pass
+        # stop LLM worker
+        try:
+            self._llm_stop_evt.set()
+            try:
+                self._llm_q.put_nowait(None)  # wake the worker
+            except Exception:
+                pass
+            if self._llm_th and self._llm_th.is_alive():
+                self._llm_th.join(timeout=1.0)
+        except Exception:
+            pass
+        # stop broadcaster loop
+        try:
+            if self._loop.is_running():
+                self._loop.call_soon_threadsafe(self._loop.stop)
+            if self._loop_th and self._loop_th.is_alive():
+                self._loop_th.join(timeout=1.0)
+        except Exception:
+            pass
 
-                # epsilon
-                if self._eps_override is not None:
-                    eps = self._eps_override
-                eps_min = float(self.params["epsilon"]["min"])
-                eps_decay = float(self.params["epsilon"]["decay"])
-                eps = max(eps_min, eps * eps_decay)
-                self._eps_override = eps
+    # ---------- checkpointing ----------
+    def _ckpt_dir(self) -> Path:
+        d = Path(getattr(cfg, "CHECKPOINT_DIR", "storage/checkpoints"))
+        d.mkdir(parents=True, exist_ok=True)
+        return d
 
-                if done: break
-                step += 1
+    def _ckpt_path(self) -> Path:
+        return self._ckpt_dir() / _algo_filename(self.params.algorithm)
 
-            duration_ms = int((time.time() - t0) * 1000)
-            avg_loss = (ep_loss_sum/max(1,ep_loss_count)) if ep_loss_count else 0.0
-            row = {
-                "episode": ep, "outcome": info.get("outcome","LOSS") if 'info' in locals() else "LOSS",
-                "reason": info.get("reason","") if 'info' in locals() else "",
-                "score": self.env.score, "snake_length": len(self.env.snake),
-                "epsilon": eps, "avg_loss": avg_loss, "steps": step, "duration_ms": duration_ms,
-                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    async def save_checkpoint(self, reason: str = "manual") -> None:
+        self._emit({"type": "saving_started", "reason": reason})
+        path = self._ckpt_path()
+        tmp = path.with_suffix(".tmp")
+        try:
+            ckpt: Dict[str, Any] = {
+                "version": 1,
+                "params": self.get_config(),
+                "episode": self.episode,
+                "total_steps": self.total_steps,
+                "eps_value": self._eps_value,
+                "agent": {
+                    "policy": self.agent.policy.state_dict(),
+                    "target": self.agent.target.state_dict(),
+                    "opt": self.agent.optimizer.state_dict(),
+                },
+                "replay": self.buffer.state_dict(),
             }
-            self.history.append(row)
-            csv_writer.writerow([row[k] for k in ["episode","outcome","reason","score","snake_length","epsilon","avg_loss","steps","duration_ms","timestamp"]])
-            csv_file.flush()
+            torch.save(ckpt, tmp.as_posix())
+            tmp.replace(path)  # atomic-ish on Windows/Posix
+            self._emit({"type": "saving_finished", "path": path.as_posix()})
+        except Exception as e:
+            try:
+                if tmp.exists():
+                    tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+            self._emit({"type": "saving_failed", "error": str(e)})
 
-            self.b.broadcast({"type":"episode_summary", **row})
-            if row["outcome"] == "WIN":
-                self.b.broadcast({"type":"game_over","episode":ep,"outcome":"WIN","win_length":len(self.env.snake),"message":"YOU WIN!"})
+    def load_checkpoint(self) -> bool:
+        path = self._ckpt_path()
+        if not path.exists():
+            return False
+        try:
+            ckpt = torch.load(path.as_posix(), map_location=self.device)
+            p = ckpt.get("params") or {}
+            self.update_config(p)
+            self.episode = int(ckpt.get("episode") or 0)
+            self.total_steps = int(ckpt.get("total_steps") or 0)
+            self._eps_value = float(ckpt.get("eps_value") or self.params.epsilon.start)
 
-            ep += 1
+            agent_sd = ckpt.get("agent") or {}
+            if agent_sd:
+                self.agent.policy.load_state_dict(agent_sd["policy"])
+                self.agent.target.load_state_dict(agent_sd["target"])
+                self.agent.optimizer.load_state_dict(agent_sd["opt"])
 
-        csv_file.close()
-        self._running = False
+            rb_sd = ckpt.get("replay")
+            if rb_sd:
+                self.buffer.load_state_dict(rb_sd)
+
+            # notify UI that a checkpoint was restored
+            self._emit({
+                "type": "checkpoint_loaded",
+                "path": path.as_posix(),
+                "episode": self.episode,
+                "total_steps": self.total_steps
+            })
+            self._emit({"type": "config_applied", "params": self.get_config()})
+            return True
+        except Exception:
+            return False
+
+    # ---------- episode logging (Excel) ----------
+    def _episodes_dir(self) -> Path:
+        d = Path(getattr(cfg, "EPISODES_DIR", "storage/episodes"))
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def _episodes_path(self) -> Path:
+        algo = (self.params.algorithm or "ddqn").strip().lower()
+        return self._episodes_dir() / f"{algo}.xlsx"
+
+    def _ensure_wb_and_sheet(self, path: Path):
+        if path.exists():
+            wb = load_workbook(path.as_posix())
+            ws = wb.active
+            if ws.max_row < 1:
+                ws.append(EPISODES_HEADERS)
+            return wb, ws
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "episodes"
+        ws.append(EPISODES_HEADERS)
+        return wb, ws
+
+    def _log_episode(self, row: Dict[str, Any]) -> None:
+        rec = dict(row)
+        rec["algorithm"] = self.params.algorithm
+        rec["grid_w"] = self.params.board["w"]
+        rec["grid_h"] = self.params.board["h"]
+        with self._episodes_lock:
+            self._episodes_buf.append(rec)
+            batch = int(getattr(cfg, "EPISODES_WRITE_BATCH", 100))
+            if len(self._episodes_buf) >= max(1, batch):
+                try:
+                    self._flush_episode_log_locked()
+                except Exception:
+                    pass  # never interrupt training
+
+    def flush_episode_log(self) -> None:
+        """Public flush (call on close/shutdown)."""
+        with self._episodes_lock:
+            self._flush_episode_log_locked()
+
+    def _flush_episode_log_locked(self) -> None:
+        if not self._episodes_buf:
+            return
+        path = self._episodes_path()
+        wb, ws = self._ensure_wb_and_sheet(path)
+        buf = self._episodes_buf
+        self._episodes_buf = []
+        for r in buf:
+            ws.append([r.get(k, "") for k in EPISODES_HEADERS])
+        wb.save(path.as_posix())
+
+    # ---------- training loop ----------
+    def _train_loop(self):
+        state = self.env.reset()
+        ep_start_ms = int(time.time() * 1000)
+        last_q: Optional[List[float]] = None
+        loss_accum: float = 0.0
+        loss_count: int = 0
+        steps_in_ep: int = 0
+
+        while not self._stop_evt.is_set():
+            if self._pause_evt.is_set():
+                time.sleep(0.02)
+                continue
+
+            # ε-greedy
+            action = self.agent.act(state, self._eps_value)
+            next_state, reward, done, info = self.env.step(action)
+            self.buffer.push(state, action, reward, next_state, float(done))
+
+            # learn
+            if len(self.buffer) >= self.params.batch_size:
+                batch = self.buffer.sample(self.params.batch_size)
+                update_target = (self.total_steps % max(1, int(self.params.target_update_freq))) == 0
+                loss = self.agent.learn(batch, target_net_update=update_target)
+                try:
+                    loss_val = float(loss.detach().item()) if hasattr(loss, "detach") else float(loss)
+                except Exception:
+                    loss_val = float(loss) if isinstance(loss, (int, float)) else 0.0
+                loss_accum += loss_val
+                loss_count += 1
+
+            # q-values for viz
+            try:
+                with torch.no_grad():
+                    s = torch.tensor(state, dtype=torch.float32, device=self.agent.device).unsqueeze(0)
+                    q = self.agent.policy(s)[0].detach().float().cpu().tolist()
+                    last_q = q
+            except Exception:
+                last_q = None
+
+            # counters
+            self.total_steps += 1
+            steps_in_ep += 1
+            self._eps_value = max(self.params.epsilon.min, self._eps_value * float(self.params.epsilon.decay))
+
+            # stream frame (decimated)
+            if (self.total_steps % VISUAL_STRIDE) == 0:
+                self._emit({"type": "state_frame", "grid": self.env.render_spec()})
+
+            # stream activations occasionally (decimated, include sizes)
+            if (self.total_steps % NN_STRIDE) == 0:
+                layers_payload: List[Dict[str, Any]] = []
+                sizes: List[int] = []
+                try:
+                    act = self.agent.activation_summary()  # dict[str, list[float]] or similar
+                except Exception:
+                    act = None
+                if act:
+                    for _, values in act.items():
+                        v = list(values) if values is not None else []
+                        layers_payload.append({"act": v})
+                        sizes.append(len(v))
+                if last_q is not None:
+                    layers_payload.append({"q": last_q})
+                    out_size = len(last_q)
+                else:
+                    out_size = 4
+                if layers_payload:
+                    self._emit({
+                        "type": "nn_activations",
+                        "layers": layers_payload,
+                        "sizes": {"hidden": sizes, "output": out_size}
+                    })
+
+            # metrics tick
+            if (self.total_steps % 5) == 0:
+                self._emit({"type": "metrics_tick", "episode": self.episode, "step": self.total_steps})
+
+            # non-blocking LLM commentary
+            if self.params.llm.freq > 0 and (self.total_steps - self._llm_last_step) >= self.params.llm.freq:
+                self._llm_last_step = self.total_steps
+                snap = {
+                    "step": self.total_steps,
+                    "episode": self.episode,
+                    "epsilon": self._eps_value,
+                    "avg_loss": (loss_accum / max(1, loss_count)),
+                    "score": self.env.score,
+                }
+                try:
+                    self._llm_q.put_nowait(snap)
+                except queue.Full:
+                    pass
+
+            # optional delay for visuals
+            d = max(0, int(self.params.step_delay_ms))
+            if d:
+                time.sleep(d / 1000.0)
+
+            # episode end
+            if done or (self.params.max_steps > 0 and steps_in_ep >= self.params.max_steps):
+                outcome = (info.get("outcome") if isinstance(info, dict) else None) or (
+                    "WIN" if len(self.env.snake) >= self.params.win_length else "LOSS"
+                )
+                reason = (info.get("reason") if isinstance(info, dict) else outcome)
+                avg_loss = (loss_accum / max(1, loss_count))
+                row = {
+                    "episode": self.episode,
+                    "outcome": outcome,
+                    "reason": reason,
+                    "score": self.env.score,
+                    "snake_length": len(self.env.snake),
+                    "epsilon": self._eps_value,
+                    "avg_loss": avg_loss,
+                    "steps": steps_in_ep,
+                    "duration_ms": int(time.time() * 1000) - ep_start_ms,
+                    "timestamp": int(time.time() * 1000),
+                }
+                self._emit({"type": "episode_summary", **row})
+                self._log_episode(row)
+
+                if outcome == "WIN":
+                    self._emit({"type": "game_over", "episode": self.episode, "outcome": "WIN",
+                                "win_length": len(self.env.snake), "message": "YOU WIN!"})
+
+                # reset episode
+                self.episode += 1
+                self.env = SnakeEnv(self.params.board["w"], self.params.board["h"], self.params.win_length)
+                state = self.env.reset()
+                ep_start_ms = int(time.time() * 1000)  # <-- start timer for the new episode
+                steps_in_ep = 0
+                loss_accum = 0.0
+                loss_count = 0
+            else:
+                state = next_state
+
+        # loop exited
+        self._emit({"type": "run_stopped", "episode": self.episode, "step": self.total_steps})

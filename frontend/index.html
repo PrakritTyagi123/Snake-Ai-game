@@ -5,23 +5,22 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Snake AI Trainer</title>
   <link rel="stylesheet" href="style.css" />
-  <!-- libs -->
   <script defer src="https://d3js.org/d3.v7.min.js"></script>
   <script defer src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body>
   <header class="app-header">
     <h1>Snake AI Trainer</h1>
+    <div id="saveIndicator" class="save-indicator hidden" aria-live="polite">Saving…</div>
   </header>
 
   <main class="layout">
-    <!-- LEFT COLUMN: fixed 600px content width, stacked panels -->
+    <!-- LEFT COLUMN -->
     <div class="left-stack">
-      <!-- Game panel -->
       <section id="gamePanel" class="panel" aria-labelledby="game-title">
         <h2 id="game-title" class="panel-title">Game</h2>
 
-        <!-- Grid size selector -->
+        <!-- Grid size + Algorithm (inline) -->
         <div class="panel-sub grid-size-row">
           <label for="gridSizeSelect" class="grid-label">Grid size</label>
           <select id="gridSizeSelect" class="grid-select" aria-label="Grid size">
@@ -31,13 +30,23 @@
             <option value="12">12 × 12</option>
             <option value="20" selected>20 × 20</option>
           </select>
+
+          <div class="algo-inline">
+            <label for="algoSelect" class="algo-label">Algorithm</label>
+            <select id="algoSelect" class="algo-select" aria-label="Algorithm">
+              <option value="DDQN" selected>DDQN</option>
+              <option value="DQN">DQN</option>
+              <option value="PPO">PPO</option>
+              <option value="A2C">A2C</option>
+            </select>
+          </div>
+
           <span class="grid-hint">Changes apply at next episode.</span>
         </div>
 
         <div class="game-wrap">
           <canvas id="gameCanvas" width="600" height="600" aria-label="Game Window"></canvas>
 
-          <!-- Overlays -->
           <div id="overlayWin" class="overlay overlay-win" aria-live="polite" aria-hidden="true">
             <div class="overlay-content">YOU WIN!</div>
           </div>
@@ -50,16 +59,15 @@
         </div>
       </section>
 
-      <!-- LLM Commentary panel (directly under the Game) -->
+      <!-- LLM Commentary -->
       <section id="llmPanel" class="panel" aria-live="polite">
         <h2 class="panel-title">LLM Commentary</h2>
         <div id="llmFeed" class="llm-feed"></div>
       </section>
     </div>
 
-    <!-- RIGHT COLUMN: visualizations, controls, table -->
+    <!-- RIGHT COLUMN -->
     <section class="right-rail panel">
-      <!-- three-way toggle -->
       <div class="panel-sub header-with-toggle">
         <div class="toggle-group" role="tablist" aria-label="Visualization Toggle">
           <button id="viewToggleNone" class="toggle red" role="tab" aria-selected="false">Nothing</button>
@@ -69,12 +77,10 @@
         <h2 class="panel-title">Visual Representation</h2>
       </div>
 
-      <!-- NN -->
       <div id="nnVisualization" class="panel-sub viz-box" aria-live="polite">
-        <svg id="nnSvg" class="nn-svg" width="100%" height="360" aria-label="Neural Network Diagram"></svg>
+        <svg id="nnSvg" class="nn-svg" width="100%" height="360" preserveAspectRatio="xMidYMid meet" aria-label="Neural Network Diagram"></svg>
       </div>
 
-      <!-- Graphs -->
       <div id="graphsPanel" class="panel-sub viz-box hidden" aria-live="polite" aria-hidden="true">
         <div class="charts-grid">
           <canvas id="scoreChart" height="120"></canvas>
@@ -83,17 +89,8 @@
         </div>
       </div>
 
-      <!-- Controls -->
       <div class="panel-sub controls-panel">
         <h2 class="panel-title">Controls</h2>
-
-        <!-- Algorithm selection (restored) -->
-        <div class="seg" id="algoSeg" role="group" aria-label="Algorithm">
-          <button class="seg-btn active" data-algo="DDQN">DDQN</button>
-          <button class="seg-btn" data-algo="DQN">DQN</button>
-          <button class="seg-btn" data-algo="PPO">PPO</button>
-          <button class="seg-btn" data-algo="A2C">A2C</button>
-        </div>
 
         <div class="buttons-row">
           <button id="startBtn" class="btn">Start</button>
@@ -103,6 +100,7 @@
           <button id="resetBtn" class="btn">Reset</button>
           <button id="saveBtn" class="btn ghost">Save Model</button>
           <button id="loadBtn" class="btn ghost">Load Model</button>
+          <button id="closeBtn" class="btn destructive">Close Project</button>
           <span id="runStatus" class="status-pill">Stopped</span>
         </div>
 
@@ -123,7 +121,6 @@
             <label for="batchSlider">Batch Size: <span id="batchVal" class="val">64</span></label>
             <input id="batchSlider" type="range" min="16" max="256" step="16" value="64">
           </div>
-          <!-- speed slider -->
           <div class="control">
             <label for="speedSlider">Speed (ms per step): <span id="speedVal" class="val">0</span></label>
             <input id="speedSlider" type="range" min="0" max="250" step="5" value="0">
@@ -131,7 +128,6 @@
         </div>
       </div>
 
-      <!-- Table -->
       <div class="panel-sub table-panel">
         <h2 class="panel-title">Episode Analysis</h2>
         <div class="table-wrap" role="region" aria-label="Analysis Table">
@@ -150,14 +146,13 @@
                 <th>Timestamp</th>
               </tr>
             </thead>
-            <tbody><!-- rows injected --></tbody>
+            <tbody></tbody>
           </table>
         </div>
       </div>
     </section>
   </main>
 
-  <!-- Config bootstrap -->
   <script>window.__CONFIG__ = { API_URL: "http://127.0.0.1:5000", WS_URL: "ws://127.0.0.1:5000/ws/stream" };</script>
   <script defer src="script.js"></script>
 </body>
